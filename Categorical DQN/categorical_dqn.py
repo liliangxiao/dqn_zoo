@@ -194,7 +194,7 @@ if __name__ == '__main__':
     batch_size = 64
     capacity = 10000
     exploration = 100
-    render = False
+    render = True
 
     env = gym.make('CartPole-v0')
     env = env.unwrapped

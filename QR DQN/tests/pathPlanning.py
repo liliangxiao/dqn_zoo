@@ -3,34 +3,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
-import gymnasium as gym
+import gym
 from collections import deque
 
+import sys
+import os
+import time
 
-class ReplayBuffer(object):
-    def __init__(self, capacity, observation_dim):
+# Adjust the path to ensure Python can find the custom_env module
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
+
+from custom_env.custom_env6 import CustomEnv6  # Import the CustomEnv6 class
+class replay_buffer(object):
+    def __init__(self, capacity):
         self.capacity = capacity
         self.memory = deque(maxlen=self.capacity)
-        self.observation_dim = observation_dim
 
-    def store(self, observation, action, reward, next_observation, done):
-        # One-hot encode observations
-        observation = np.eye(self.observation_dim)[observation]
-        next_observation = np.eye(self.observation_dim)[next_observation]
+    def store(self, observation, action, reward, next_observation, done, ):
+        observation = np.expand_dims(observation, 0)
+        next_observation = np.expand_dims(next_observation, 0)
         self.memory.append([observation, action, reward, next_observation, done])
 
     def sample(self, size):
         batch = random.sample(self.memory, size)
-        observation, action, reward, next_observation, done = zip(*batch)
-        return np.array(observation), action, reward, np.array(next_observation), done
+        observation, action, reward, next_observation, done = zip(* batch)
+        return np.concatenate(observation, 0), action, reward, np.concatenate(next_observation, 0), done
 
     def __len__(self):
         return len(self.memory)
 
 
-class QR_DQN(nn.Module):
+class qr_dqn(nn.Module):
     def __init__(self, observation_dim, action_dim, quant_num):
-        super(QR_DQN, self).__init__()
+        super(qr_dqn, self).__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
         self.quant_num = quant_num
@@ -50,59 +57,54 @@ class QR_DQN(nn.Module):
         return x
 
     def act(self, observation, epsilon):
-        self.eval()
-        observation = observation.to(device)
         if random.random() > epsilon:
-            with torch.no_grad():
-                dist = self.forward(observation)
-                q_values = dist.mean(2)
-                action = q_values.argmax(dim=1).item()
+            dist = self.forward(observation)
+            action = dist.mean(2).max(1)[1].detach()[0].item()
         else:
             action = random.choice(list(range(self.action_dim)))
-        self.train()
         return action
 
 
 def get_target_distribution(target_model, next_observation, reward, done, gamma, action_dim, quant_num):
     batch_size = next_observation.size(0)
-    device = next_observation.device
 
     next_dist = target_model.forward(next_observation).detach()
     next_action = next_dist.mean(2).max(1)[1].detach()
-    next_action = next_action.unsqueeze(1).unsqueeze(2).expand(batch_size, 1, quant_num)
+    next_action = next_action.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, quant_num)
     next_dist = next_dist.gather(1, next_action).squeeze(1)
 
     reward = reward.unsqueeze(1).expand(batch_size, quant_num)
     done = done.unsqueeze(1).expand(batch_size, quant_num)
     target_dist = reward + gamma * (1 - done) * next_dist
-    target_dist = target_dist.clamp(0, 1)
+    target_dist.detach_()
 
-    quant_idx = torch.argsort(next_dist, dim=1)
-    tau_hat = torch.linspace(0.0, 1.0 - 1. / quant_num, quant_num, device=device) + 0.5 / quant_num
+    quant_idx = torch.sort(next_dist, 1, descending=False)[1]
+    # Midpoint quantile targets need to sort
+    tau_hat = torch.linspace(0.0, 1.0 - 1. / quant_num, quant_num) + 0.5 / quant_num
     tau_hat = tau_hat.unsqueeze(0).expand(batch_size, quant_num)
-    tau = tau_hat.gather(1, quant_idx)
-
+    batch_idx = np.arange(batch_size)
+    tau = tau_hat[:, quant_idx][batch_idx, batch_idx]
     return target_dist, tau
 
 
 def train(eval_model, target_model, buffer, optimizer, gamma, action_dim, quant_num, batch_size, count, update_freq, k=1.):
     observation, action, reward, next_observation, done = buffer.sample(batch_size)
 
-    observation = torch.FloatTensor(observation).to(device)
-    action = torch.LongTensor(action).to(device)
-    reward = torch.FloatTensor(reward).to(device)
-    next_observation = torch.FloatTensor(next_observation).to(device)
-    done = torch.FloatTensor(done).to(device)
+    observation = torch.FloatTensor(observation)
+    action = torch.LongTensor(action)
+    reward = torch.FloatTensor(reward)
+    next_observation = torch.FloatTensor(next_observation)
+    done = torch.FloatTensor(done)
 
     dist = eval_model.forward(observation)
-    action = action.unsqueeze(1).unsqueeze(2).expand(batch_size, 1, quant_num)
+    action = action.unsqueeze(1).unsqueeze(1).expand(batch_size, 1, quant_num)
     dist = dist.gather(1, action).squeeze(1)
     target_dist, tau = get_target_distribution(target_model, next_observation, reward, done, gamma, action_dim, quant_num)
 
     u = target_dist - dist
 
     huber_loss = 0.5 * u.abs().clamp(min=0., max=k).pow(2)
-    huber_loss += k * (u.abs() - u.abs().clamp(min=0., max=k) - 0.5 * k)
+    huber_loss = huber_loss + k * (u.abs() - u.abs().clamp(min=0., max=k) - 0.5 * k)
     quantile_loss = (tau - (u < 0).float()).abs() * huber_loss
     loss = quantile_loss.sum() / batch_size
 
@@ -116,7 +118,6 @@ def train(eval_model, target_model, buffer, optimizer, gamma, action_dim, quant_
 
 
 if __name__ == '__main__':
-    # Hyperparameters
     epsilon_init = 0.95
     epsilon_decay = 0.995
     epsilon_min = 0.01
@@ -124,67 +125,60 @@ if __name__ == '__main__':
     learning_rate = 1e-3
     capacity = 100000
     exploration = 200
-    episodes = 500
+    episode = 1000000
     quant_num = 10
     update_freq = 200
     batch_size = 64
     k = 1.
-    render = True  # Set to False for faster training
+    render = False
 
-    # Define device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Define start and goal positions
+    start = [34,0]  # Replace with actual start coordinates
+    goal = [118,198]    # Replace with actual goal coordinates
+    # Path to your .mat data file
+    data_file_path = os.path.join(parent_dir, 'Toronto_map_complex_all.mat')
 
-    # Initialize environment
-    env = gym.make('FrozenLake-v1', is_slippery=False, render_mode='ansi')
+    # Check if the data file exists
+    if not os.path.exists(data_file_path):
+        print(f"Data file not found at path: {data_file_path}")
+        sys.exit(1)
+
+    # Create environment
+    env = CustomEnv6(start, goal, data_file=data_file_path, render_mode='human')
     env = env.unwrapped
-    observation_dim = env.observation_space.n
+    observation_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
-    buffer = ReplayBuffer(capacity, observation_dim)
-
-    # Initialize networks
-    eval_net = QR_DQN(observation_dim, action_dim, quant_num).to(device)
-    target_net = QR_DQN(observation_dim, action_dim, quant_num).to(device)
+    buffer = replay_buffer(capacity)
+    eval_net = qr_dqn(observation_dim, action_dim, quant_num)
+    target_net = qr_dqn(observation_dim, action_dim, quant_num)
     target_net.load_state_dict(eval_net.state_dict())
-    target_net.eval()  # Set target network to evaluation mode
-
-    # Initialize optimizer
     optimizer = torch.optim.Adam(eval_net.parameters(), lr=learning_rate)
-
-    # Initialize variables
     count = 0
     epsilon = epsilon_init
     weight_reward = None
 
-    for i in range(episodes):
+    for i in range(episode):
         obs, info = env.reset()
         reward_total = 0
         if render:
             env.render()
         while True:
-            # Convert observation to one-hot tensor
-            obs_one_hot = np.eye(observation_dim)[obs]
-            obs_tensor = torch.FloatTensor(obs_one_hot).unsqueeze(0).to(device)  # Shape: [1, observation_dim]
-            action = eval_net.act(obs_tensor, epsilon)
-            next_obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
+            action = eval_net.act(torch.FloatTensor(np.expand_dims(obs, 0)), epsilon)
+            next_obs, reward, done, info = env.step(action)
             buffer.store(obs, action, reward, next_obs, done)
             if render:
                 env.render()
             reward_total += reward
-            count += 1
+            count = count + 1
             obs = next_obs
-            if len(buffer) > exploration:
+            if i > exploration:
                 train(eval_net, target_net, buffer, optimizer, gamma, action_dim, quant_num, batch_size, count, update_freq, k=1.)
             if done:
                 if epsilon > epsilon_min:
-                    epsilon = max(epsilon * epsilon_decay, epsilon_min)
-                if weight_reward is None:
+                    epsilon = epsilon * epsilon_decay
+                if not weight_reward:
                     weight_reward = reward_total
                 else:
                     weight_reward = 0.99 * weight_reward + 0.01 * reward_total
-                print(f'episode: {i+1}  reward: {reward_total}  weight_reward: {weight_reward:.3f}  epsilon: {epsilon:.2f}')
+                print('episode: {}  reward: {}  weight_reward: {:.3f}  epsilon: {:.2f}'.format(i+1, reward_total, weight_reward, epsilon))
                 break
-
-    # Save the trained model
-    torch.save(eval_net.state_dict(), 'qr_dqn_frozenlake.pth')
-env.close()

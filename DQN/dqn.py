@@ -89,7 +89,7 @@ if __name__ == '__main__':
     gamma = 0.99
     loss_fn = nn.MSELoss()
 
-    env = gym.make('CartPole-v0')
+    env = gym.make('CartPole-v1')
     env = env.unwrapped
     action_dim = env.action_space.n
     observation_dim = env.observation_space.shape[0]

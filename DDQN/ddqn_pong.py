@@ -6,6 +6,7 @@ import random
 import sys
 sys.path.append('.')
 from collections import deque
+
 from common.wrappers import make_atari, wrap_deepmind, wrap_pytorch
 import math
 
